@@ -1,0 +1,18 @@
+services:
+  intraday-outlier-app:
+    build: .
+    container_name: intraday-outlier-app
+
+    ports:
+      - "8501:8501"
+
+    volumes:
+      - ./data_final:/app/data_final
+      - ./models:/app/models
+      - ./src:/app/src
+      - ./app.py:/app/app.py
+
+    environment:
+      - TZ=Europe/Vienna
+
+    restart: unless-stopped
