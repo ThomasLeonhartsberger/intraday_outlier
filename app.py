@@ -36,6 +36,9 @@ def cached_predict_residuals(
     date_from: str,
     date_to: str,
 ) -> pd.DataFrame:
+    """
+    Cache residual predictions for the selected input dataframe and date range.
+    """
     return predict_residuals(
         df=df,
         date_from=date_from,
@@ -126,8 +129,11 @@ iqr_multiplier = st.sidebar.number_input(
 # =========================================================
 
 if st.sidebar.button("Flag outliers"):
+
+    # Outlier detection requires the source data to be loaded first
     if "df" not in st.session_state:
         st.sidebar.warning("Please load data first.")
+
     else:
         with st.spinner("Predicting residuals and flagging outliers..."):
             df = st.session_state["df"]
@@ -199,6 +205,7 @@ any_flags = int(
 
 n_selected = int(selected_mask.sum())
 
+# Avoid division by zero if no observations were flagged
 mad_overlap_share = both_flags / mad_flags if mad_flags > 0 else 0.0
 iqr_overlap_share = both_flags / iqr_flags if iqr_flags > 0 else 0.0
 any_flag_share = any_flags / n_selected if n_selected > 0 else 0.0
@@ -255,6 +262,7 @@ if not days:
 
 flag_counts = []
 
+# Count outliers per day to select the most relevant day by default
 for day in days:
     tmp = filter_day(flagged_df, day)
     flag_counts.append(
@@ -273,9 +281,11 @@ flag_counts_df = flag_counts_df.sort_values(
 
 default_day = flag_counts_df.iloc[0]["day"]
 
+# Initialize selected day with the day containing the most flags
 if "selected_day" not in st.session_state:
     st.session_state["selected_day"] = default_day
 
+# Reset selected day if the stored value is not available for the loaded month
 if st.session_state["selected_day"] not in days:
     st.session_state["selected_day"] = default_day
 
@@ -285,21 +295,25 @@ col_prev, col_jump, col_next = st.columns([1, 4, 1])
 
 with col_prev:
     if st.button("⬅ Previous day"):
+
+        # Move one day back if this is not already the first day
         if current_idx > 0:
             st.session_state["selected_day"] = days[current_idx - 1]
             st.rerun()
 
 with col_next:
     if st.button("Next day ➡"):
+
+        # Move one day forward if this is not already the last day
         if current_idx < len(days) - 1:
             st.session_state["selected_day"] = days[current_idx + 1]
             st.rerun()
 
 with col_jump:
-    selected_day = st.selectbox(
+    st.selectbox(
         "Jump to day",
         options=days,
-        index=days.index(st.session_state["selected_day"]),
+        key="selected_day",
         format_func=lambda x: (
             f"{pd.Timestamp(x).strftime('%Y-%m-%d')} "
             f"(flags: "
@@ -307,7 +321,7 @@ with col_jump:
         ),
     )
 
-st.session_state["selected_day"] = selected_day
+selected_day = st.session_state["selected_day"]
 
 day_df = filter_day(flagged_df, selected_day)
 
@@ -420,6 +434,9 @@ def regression_metrics(
     y_true: pd.Series,
     y_pred: pd.Series,
 ) -> dict:
+    """
+    Calculate standard regression metrics for one prediction series.
+    """
     err = y_true - y_pred
     abs_err = err.abs()
 
@@ -428,6 +445,8 @@ def regression_metrics(
 
     ss_res = err.pow(2).sum()
     ss_tot = (y_true - y_true.mean()).pow(2).sum()
+
+    # Avoid division by zero if the observed series has no variance
     r2 = 1 - ss_res / ss_tot if ss_tot != 0 else float("nan")
 
     q95_abs_error = abs_err.quantile(0.95)
@@ -464,6 +483,7 @@ metrics_df = pd.DataFrame(
     ]
 )
 
+# Round error-based metrics for display
 for col in ["MAE", "RMSE", "Mean Q95 abs. error"]:
     metrics_df[col] = metrics_df[col].round(2)
 
@@ -508,6 +528,7 @@ metrics_month_df = pd.DataFrame(
     ]
 )
 
+# Round error-based metrics for display
 for col in ["MAE", "RMSE", "Mean Q95 abs. error"]:
     metrics_month_df[col] = metrics_month_df[col].round(2)
 

@@ -19,37 +19,54 @@ class OutlierConfig:
 
 def month_bounds(month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
     """
-    month: '2026-02' or '2026-02-01'
-    returns selected month start and month end inclusive.
+    Return the start and inclusive end date of the selected month.
+
+    Parameters
+    ----------
+    month:
+        Month string such as '2026-02' or '2026-02-01'.
     """
     month_start = pd.Timestamp(month).tz_localize(TZ_NAME).replace(day=1)
     next_month = month_start + pd.DateOffset(months=1)
     month_end = next_month - pd.Timedelta(days=1)
+
     return month_start, month_end
 
 
 def reference_bounds_for_month(month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
     """
-    Previous 12 full months before selected month.
-    Example:
+    Return the previous 12 full months before the selected month.
+
+    Example
+    -------
     selected month: 2026-02
-    reference: 2025-02-01 to 2026-01-31
+    reference: 2025-02-01 to 2026-01-31 23:45
     """
     month_start, _ = month_bounds(month)
     ref_start = month_start - pd.DateOffset(months=12)
     ref_end = month_start - pd.Timedelta(minutes=15)
+
     return ref_start, ref_end
 
 
 def find_project_root(start: Path | None = None) -> Path:
+    """
+    Find the project root by walking upwards from the current or given path.
+    """
     current = (start or Path.cwd()).resolve()
+
+    # Walk upwards until the expected project folders are found
     for path in [current, *current.parents]:
         if (path / "src").exists() and (path / "data_final").exists():
             return path
+
     return current
 
 
 def default_price_path(root: Path | None = None) -> Path:
+    """
+    Return the default path to the ID1/ID3 price Excel file.
+    """
     root = root or find_project_root()
     return root / "data_final" / "prices" / "id1_id3.xlsx"
 
@@ -58,8 +75,14 @@ def load_id1_price_dates(
     price_path: str | Path | None = None,
     sheet_name: str = "qh",
 ) -> pd.DataFrame:
+    """
+    Load ID1 price timestamps from the price Excel file.
+
+    The returned dataframe contains only valid datetime and ID1 price rows.
+    """
     path = Path(price_path) if price_path is not None else default_price_path()
 
+    # Stop early if the expected confidential price file is missing
     if not path.exists():
         raise FileNotFoundError(
             f"Price file not found: {path}. "
@@ -77,6 +100,8 @@ def load_id1_price_dates(
     df.columns = ["datetime", "id1", "id3"]
 
     df["datetime"] = pd.to_datetime(df["datetime"])
+
+    # Localize Excel timestamps and handle daylight-saving-time edge cases
     df["datetime"] = (
         df["datetime"]
         .dt.tz_localize(
@@ -86,6 +111,7 @@ def load_id1_price_dates(
         )
     )
 
+    # Normalize datetime handling and ensure ID1 is numeric
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(TZ_NAME)
     df["id1"] = pd.to_numeric(df["id1"], errors="coerce")
 
@@ -97,18 +123,20 @@ def get_available_selected_month_end(
     price_path: str | Path | None = None,
 ) -> pd.Timestamp:
     """
-    Checks how far ID1 prices are available within the selected month.
+    Check how far ID1 prices are available within the selected month.
     """
     month_start, month_end = month_bounds(month)
     month_end_excl = month_end + pd.Timedelta(days=1)
 
     prices = load_id1_price_dates(price_path=price_path)
 
+    # Keep only available price rows inside the selected month
     prices_month = prices[
         (prices["datetime"] >= month_start)
         & (prices["datetime"] < month_end_excl)
     ].copy()
 
+    # A selected month without prices cannot be used for outlier detection
     if prices_month.empty:
         raise ValueError(
             f"No ID1 QH prices found for selected month {month_start:%Y-%m}."
@@ -121,6 +149,9 @@ def validate_selected_month(
     month: str,
     price_path: str | Path | None = None,
 ) -> dict:
+    """
+    Validate selected month and return the date range required for data preparation.
+    """
     month_start, month_end = month_bounds(month)
     available_until = get_available_selected_month_end(
         month=month,
@@ -141,14 +172,19 @@ def fit_mad_thresholds(
     reference_residuals: pd.Series,
     threshold: float = 3.5,
 ) -> dict:
+    """
+    Fit MAD-based lower and upper residual thresholds on the reference period.
+    """
     x = pd.to_numeric(reference_residuals, errors="coerce").dropna().to_numpy()
 
+    # A threshold cannot be fitted without valid historical residuals
     if len(x) == 0:
         raise ValueError("No valid reference residuals available for MAD.")
 
     median = float(np.nanmedian(x))
     mad = float(np.nanmedian(np.abs(x - median)))
 
+    # MAD must be non-zero to avoid invalid threshold scaling
     if mad == 0 or np.isnan(mad):
         raise ValueError("MAD is zero or NaN. Cannot calculate MAD flags.")
 
@@ -169,8 +205,12 @@ def fit_iqr_thresholds(
     reference_residuals: pd.Series,
     multiplier: float = 1.5,
 ) -> dict:
+    """
+    Fit IQR-based lower and upper residual thresholds on the reference period.
+    """
     x = pd.to_numeric(reference_residuals, errors="coerce").dropna().to_numpy()
 
+    # A threshold cannot be fitted without valid historical residuals
     if len(x) == 0:
         raise ValueError("No valid reference residuals available for IQR.")
 
@@ -198,8 +238,7 @@ def apply_outlier_flags(
     config: OutlierConfig | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Uses previous 12 full months as reference period.
-    Flags only the selected month.
+    Fit thresholds on the previous 12 full months and flag only the selected month.
     """
     config = config or OutlierConfig()
 
@@ -212,11 +251,13 @@ def apply_outlier_flags(
     ref_start, ref_end = reference_bounds_for_month(month)
     ref_end_excl = ref_end + pd.Timedelta(minutes=15)
 
+    # Select the 12-month reference period used to fit MAD/IQR thresholds
     ref_mask = (
         (df["datetime"] >= ref_start)
         & (df["datetime"] < ref_end_excl)
     )
 
+    # Select only the target month where outlier flags should be applied
     selected_mask = (
         (df["datetime"] >= month_start)
         & (df["datetime"] < selected_end_excl)
@@ -240,11 +281,13 @@ def apply_outlier_flags(
 
     selected_resid = df.loc[selected_mask, config.residual_col]
 
+    # Apply MAD thresholds only to observations in the selected month
     df.loc[selected_mask, "mad_flag"] = (
         (selected_resid < mad_info["lower"])
         | (selected_resid > mad_info["upper"])
     )
 
+    # Apply IQR thresholds only to observations in the selected month
     df.loc[selected_mask, "iqr_flag"] = (
         (selected_resid < iqr_info["lower"])
         | (selected_resid > iqr_info["upper"])
@@ -270,12 +313,16 @@ def apply_outlier_flags(
 
 
 def get_days_for_selected_month(flagged_df: pd.DataFrame, month: str) -> list[pd.Timestamp]:
+    """
+    Return all available calendar days within the selected month.
+    """
     df = flagged_df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(TZ_NAME)
 
     month_start, month_end = month_bounds(month)
     month_end_excl = month_end + pd.Timedelta(days=1)
 
+    # Keep only rows belonging to the selected month
     selected = df[
         (df["datetime"] >= month_start)
         & (df["datetime"] < month_end_excl)
@@ -285,12 +332,16 @@ def get_days_for_selected_month(flagged_df: pd.DataFrame, month: str) -> list[pd
 
 
 def filter_day(flagged_df: pd.DataFrame, day) -> pd.DataFrame:
+    """
+    Filter flagged residual data to one selected calendar day.
+    """
     df = flagged_df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(TZ_NAME)
 
     day_start = pd.Timestamp(day).tz_localize(TZ_NAME)
     day_end = day_start + pd.Timedelta(days=1)
 
+    # Keep only observations inside the selected day
     return df[
         (df["datetime"] >= day_start)
         & (df["datetime"] < day_end)

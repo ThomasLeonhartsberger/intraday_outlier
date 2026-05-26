@@ -80,116 +80,190 @@ EXCHANGE_COUNTRIES = ["DE", "CH", "CZ", "IT", "HU", "SI"]
 # =========================================================
 
 def find_project_root(start: Path | None = None) -> Path:
+    """
+    Find the project root by walking upwards from the current or given path.
+    """
     current = (start or Path.cwd()).resolve()
+
+    # Walk upwards until expected project folders are found
     for path in [current, *current.parents]:
         if (path / "src").exists() and ((path / "data_final").exists() or (path / "notebooks").exists()):
             return path
+
     return current
 
 
 def default_data_path(root: Path | None = None) -> Path:
+    """
+    Return the default path to the final combined quarter-hourly dataset.
+    """
     root = root or find_project_root()
     return root / "data_final" / "combined_data_qh.csv"
 
+
 def default_price_path(root: Path | None = None) -> Path:
+    """
+    Return the default path to the confidential ID1/ID3 price file.
+    """
     root = root or find_project_root()
     return root / "data_final" / "prices" / "id1_id3.xlsx"
+
 
 # =========================================================
 # TIME HELPERS
 # =========================================================
 
 def _localize_start(date_str: str) -> pd.Timestamp:
+    """
+    Convert a user-provided start date to a Vienna-local timestamp.
+    """
     return pd.Timestamp(date_str).tz_localize(TZ_NAME)
 
 
 def _localize_end_exclusive(date_str: str) -> pd.Timestamp:
-    # User-facing end date is inclusive, so 2026-01-31 means until 2026-02-01 00:00 exclusive.
+    """
+    Convert an inclusive user-facing end date to an exclusive end timestamp.
+    """
+    # User-facing end date is inclusive, so 2026-01-31 means until 2026-02-01 00:00 exclusive
     return pd.Timestamp(date_str).tz_localize(TZ_NAME) + pd.Timedelta(days=1)
 
 
 def _required_index(date_from: str, date_to: str) -> pd.DatetimeIndex:
+    """
+    Build the required quarter-hourly timestamp index for an inclusive date range.
+    """
     start = _localize_start(date_from)
     end_excl = _localize_end_exclusive(date_to)
     return pd.date_range(start, end_excl - pd.Timedelta(minutes=15), freq=FREQ)
 
 
 def _date_str(ts: pd.Timestamp) -> str:
+    """
+    Format a timestamp as YYYY-MM-DD in the project timezone.
+    """
     return ts.tz_convert(TZ_NAME).strftime("%Y-%m-%d")
 
 
 def _missing_spans(existing: pd.DataFrame, date_from: str, date_to: str) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Find contiguous missing quarter-hourly spans in the existing dataset.
+    """
     required = _required_index(date_from, date_to)
+
+    # If no usable existing data is available, the full requested range is missing
     if existing.empty or "datetime" not in existing.columns:
         return [(required[0], required[-1])]
 
     have = pd.DatetimeIndex(pd.to_datetime(existing["datetime"], utc=True).dt.tz_convert(TZ_NAME))
     missing = required.difference(have)
+
     if missing.empty:
         return []
 
     spans = []
     start = prev = missing[0]
+
+    # Group consecutive missing timestamps into contiguous query spans
     for ts in missing[1:]:
         if ts - prev == pd.Timedelta(minutes=15):
             prev = ts
         else:
             spans.append((start, prev))
             start = prev = ts
+
     spans.append((start, prev))
     return spans
+
 
 # =========================================================
 # ENTSO-E PARSERS
 # =========================================================
 
 def _parse_iso_duration(res: str) -> pd.Timedelta:
+    """
+    Convert an ENTSO-E ISO duration string such as PT15M or PT1H to Timedelta.
+    """
     m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?", res)
+
+    # Unsupported duration formats are stopped explicitly
     if not m:
         raise ValueError(f"Unsupported duration: {res}")
+
     return pd.Timedelta(hours=int(m.group(1) or 0), minutes=int(m.group(2) or 0))
 
 
 def _iterate_periods(data: dict):
+    """
+    Iterate through ENTSO-E instance, period, and pointMap structures.
+
+    Yields the instance metadata, timestamp, and value container.
+    """
+    # Iterate over all time-series instances returned by the API
     for inst in data.get("instanceList", []):
+
+        # Iterate over all periods within the current curve
         for period in inst.get("curveData", {}).get("periodList", []):
             start_utc = pd.to_datetime(period["timeInterval"]["from"], utc=True)
             res = _parse_iso_duration(period.get("resolution", "PT15M"))
+
+            # Iterate over all timestamped values inside the period
             for idx_str, vals in period.get("pointMap", {}).items():
                 try:
                     idx = int(idx_str)
                 except Exception:
                     continue
+
                 yield inst, start_utc + idx * res, vals
 
 
 def parse_meta_columns(data: dict) -> pd.DataFrame:
+    """
+    Parse ENTSO-E responses where output columns are defined in metaData.
+    """
     meta = data.get("metaData", [])
+
+    # Build output column names from the metadata entries
     col_names = [m.get("code", f"col{i}") for i, m in enumerate(meta)]
+
     rows = []
+
+    # Convert each timestamped API value into one dataframe row
     for _, ts, vals in _iterate_periods(data):
         if not isinstance(vals, list):
             vals = [vals]
+
         vals = vals + [None] * (len(col_names) - len(vals))
+
         row = {"timestamp_utc": ts}
         row.update({c: v for c, v in zip(col_names, vals)})
         rows.append(row)
+
     return pd.DataFrame(rows)
 
 
 def parse_load(data: dict) -> pd.DataFrame:
+    """
+    Parse ENTSO-E load forecast and actual load data.
+    """
     rows = []
+
+    # Extract load forecast and actual values for each timestamp
     for _, ts, vals in _iterate_periods(data):
         vals = vals if isinstance(vals, list) else [vals]
+
         rows.append({
             "timestamp_utc": ts,
             "load_forecast_mw": vals[0] if len(vals) > 0 else None,
             "load_actual_mw": vals[1] if len(vals) > 1 else None,
         })
+
     return pd.DataFrame(rows)
 
 
 def parse_generation_by_type(data: dict) -> pd.DataFrame:
+    """
+    Parse actual generation by production type and pivot it to feature columns.
+    """
     mapping = {
         "B01": "biomass_mw",
         "B04": "fossil_gas_mw",
@@ -199,23 +273,34 @@ def parse_generation_by_type(data: dict) -> pd.DataFrame:
         "B16": "solar_mw",
         "B19": "wind_onshore_mw",
     }
+
     rows = []
+
+    # Convert each production-type observation into long format first
     for inst, ts, vals in _iterate_periods(data):
         prod_type = inst.get("businessDimensionMap", {}).get("PRODUCTION_TYPE", "UNKNOWN")
         val = vals[0] if isinstance(vals, list) and vals else vals
+
+        # Some API responses wrap the actual value inside a quantity field
         if isinstance(val, dict):
             val = val.get("quantity")
+
         rows.append({
             "timestamp_utc": ts,
             "PRODUCTION_TYPE": mapping.get(prod_type, prod_type),
             "value": val,
         })
+
     if not rows:
         return pd.DataFrame(columns=["timestamp_utc"])
+
     return pd.DataFrame(rows).pivot(index="timestamp_utc", columns="PRODUCTION_TYPE", values="value").reset_index()
 
 
 def parse_scheduled_exchange(data: dict) -> pd.DataFrame:
+    """
+    Parse scheduled commercial exchange data into directional flow columns.
+    """
     contract_map = {"A01": "day_ahead", "A05": "total"}
     area_map = {
         "BZN|10YAT-APG------L": "AT",
@@ -226,26 +311,41 @@ def parse_scheduled_exchange(data: dict) -> pd.DataFrame:
         "BZN|10Y1001A1001A73I": "IT",
         "BZN|10YSI-ELES-----O": "SI",
     }
+
     rows = []
+
+    # Extract one directional exchange value per timestamp and contract type
     for inst, ts, vals in _iterate_periods(data):
         dims = inst.get("businessDimensionMap", {})
+
         out_area = area_map.get(dims.get("OUT_AREA"), dims.get("OUT_AREA"))
         in_area = area_map.get(dims.get("IN_AREA"), dims.get("IN_AREA"))
         contract = contract_map.get(dims.get("CONTRACT_TYPE"), dims.get("CONTRACT_TYPE"))
+
         val = vals[0] if isinstance(vals, list) and vals else None
+
         if in_area and out_area and contract:
             rows.append({"timestamp_utc": ts, f"{in_area}_to_{out_area}_{contract}": val})
+
     if not rows:
         return pd.DataFrame(columns=["timestamp_utc"])
+
     return pd.DataFrame(rows).groupby("timestamp_utc", as_index=False).agg("first")
 
 
 def parse_day_ahead_prices(data: dict) -> pd.DataFrame:
+    """
+    Parse ENTSO-E day-ahead price data.
+    """
     rows = []
+
+    # Extract one day-ahead price value per timestamp
     for _, ts, vals in _iterate_periods(data):
         rows.append({"timestamp_utc": ts, "day_ahead_price": vals[0] if isinstance(vals, list) and vals else None})
+
     if not rows:
         return pd.DataFrame(columns=["timestamp_utc", "day_ahead_price"])
+
     return pd.DataFrame(rows).groupby("timestamp_utc", as_index=False).agg("first")
 
 
@@ -260,30 +360,49 @@ ENTSOE_ENDPOINTS = {
 
 
 def _post_with_retry(endpoint: str, payload: dict) -> dict:
+    """
+    Send a POST request to ENTSO-E with retry logic.
+    """
     url = ENTSOE_BASE_URL + endpoint
+
+    # Retry temporary request failures before giving up
     for attempt in range(MAX_RETRIES):
         try:
             r = requests.post(url, headers=ENTSOE_HEADERS, data=json.dumps(payload), timeout=30)
             r.raise_for_status()
             return r.json()
+
         except requests.exceptions.RequestException as exc:
             if attempt == MAX_RETRIES - 1:
                 raise
+
             print(f"ENTSO-E attempt {attempt + 1}/{MAX_RETRIES} failed: {exc}")
             time.sleep(5)
+
     raise RuntimeError("unreachable")
 
 
 def _generate_query_window(date_from: str, date_to: str):
+    """
+    Generate local and UTC query bounds with buffer days for timezone safety.
+    """
     local_start = TZ_LOCAL.localize(datetime.strptime(date_from, "%Y-%m-%d"))
     local_end = TZ_LOCAL.localize(datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1))
+
+    # Add one day before and after to avoid timezone-boundary data loss
     utc_start = (local_start - timedelta(days=1)).astimezone(TZ_UTC)
     utc_end = (local_end + timedelta(days=1)).astimezone(TZ_UTC)
+
     return local_start, local_end, utc_start, utc_end
 
 
 def _chunk_range(start: datetime, end: datetime, chunk_days: int):
+    """
+    Yield smaller API query chunks between start and end.
+    """
     current = start
+
+    # Step through the query range in API-safe chunks
     while current < end:
         chunk_end = min(current + timedelta(days=chunk_days), end)
         yield current, chunk_end
@@ -291,12 +410,19 @@ def _chunk_range(start: datetime, end: datetime, chunk_days: int):
 
 
 def query_entsoe(dataset: str, date_from: str, date_to: str, area: str = AUSTRIA_AREA, chunk_days: int = CHUNK_DAYS) -> pd.DataFrame:
+    """
+    Query one ENTSO-E dataset and return it as a Vienna-time indexed dataframe.
+    """
     cfg = ENTSOE_ENDPOINTS[dataset]
     local_start, local_end, utc_start, utc_end = _generate_query_window(date_from, date_to)
     fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+
     dfs = []
+
+    # Query all chunks, parse each response, and collect the partial dataframes
     for chunk_start, chunk_end in _chunk_range(utc_start, utc_end, chunk_days):
         print(f"Querying {dataset}: {chunk_start} -> {chunk_end}")
+
         payload = {
             "dateTimeRange": {"from": chunk_start.strftime(fmt), "to": chunk_end.strftime(fmt)},
             "areaList": [f"BZN|{area}"],
@@ -304,20 +430,33 @@ def query_entsoe(dataset: str, date_from: str, date_to: str, area: str = AUSTRIA
             "sorterList": [],
             "filterMap": {},
         }
+
         dfs.append(cfg["parser"](_post_with_retry(cfg["endpoint"], payload)))
+
     if not dfs:
         return pd.DataFrame()
+
     df = pd.concat(dfs, ignore_index=True)
+
+    # Parser output without timestamps cannot be aligned to the modeling index
     if "timestamp_utc" not in df.columns:
         return pd.DataFrame()
+
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
     df["datetime"] = df["timestamp_utc"].dt.tz_convert(TZ_NAME)
+
     df = df.drop(columns=["timestamp_utc"], errors="ignore").set_index("datetime").sort_index()
+
+    # Remove the timezone buffer and keep only the requested local period
     df = df[(df.index >= local_start) & (df.index < local_end)]
+
     return df.apply(pd.to_numeric, errors="coerce")
 
 
 def query_entsoe_qh(date_from: str, date_to: str) -> pd.DataFrame:
+    """
+    Query and combine all required ENTSO-E quarter-hourly input datasets.
+    """
     df_load = query_entsoe("load", date_from, date_to)
     df_solar = query_entsoe("solar_forecast", date_from, date_to)
     df_wind = query_entsoe("wind_onshore_forecast", date_from, date_to)
@@ -325,12 +464,15 @@ def query_entsoe_qh(date_from: str, date_to: str) -> pd.DataFrame:
     df_exchange = query_entsoe("scheduled_exchange", date_from, date_to)
     df_prices = query_entsoe("day_ahead_prices", date_from, date_to, chunk_days=1)
 
+    # Keep and rename only the forecast/current renewable columns used later
     df_solar = df_solar[[c for c in ["DAY_AHEAD", "CURRENT"] if c in df_solar.columns]].rename(
         columns={"DAY_AHEAD": "solar_day_ahead", "CURRENT": "solar_current"}
     )
     df_wind = df_wind[[c for c in ["DAY_AHEAD", "CURRENT"] if c in df_wind.columns]].rename(
         columns={"DAY_AHEAD": "wind_day_ahead", "CURRENT": "wind_current"}
     )
+
+    # Scheduled exchange is hourly, so forward-fill it to quarter-hourly resolution
     df_exchange_qh = df_exchange.resample(FREQ).ffill()
 
     return (
@@ -347,16 +489,27 @@ def query_entsoe_qh(date_from: str, date_to: str) -> pd.DataFrame:
 # =========================================================
 
 def fetch_outage_events(country: str, date_from: str, date_to: str) -> pd.DataFrame:
+    """
+    Fetch raw EEX outage events for one country and date range.
+    """
     params = {"country": country, "concernedDateFrom": date_from, "concernedDateTo": date_to}
+
     session = requests.Session()
     session.headers.update(EEX_HEADERS)
+
     r = session.get(EEX_BASE_URL, params=params, timeout=60)
     r.raise_for_status()
+
     js = r.json()
+
+    # Combine API header fields and row values into dataframe records
     return pd.DataFrame([dict(zip(js["header"], row)) for row in js["data"]])
 
 
 def split_message_id(message_id):
+    """
+    Split an EEX message ID into base ID and version number.
+    """
     try:
         base, version = str(message_id).rsplit("_", 1)
         return base, int(version)
@@ -365,119 +518,204 @@ def split_message_id(message_id):
 
 
 def clean_outage_events(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter and standardize raw EEX outage events for feature construction.
+    """
     if df_raw.empty:
         return df_raw
+
     df = df_raw.copy()
+
+    # Keep only unplanned production unavailability events
     df = df[(df["unavailabilityType"] == "Unplanned") & (df["eventType"] == "Production unavailability")].copy()
+
     df["base_id"] = df["messageID"].map(lambda x: split_message_id(x)[0])
     df["version"] = df["messageID"].map(lambda x: split_message_id(x)[1])
+
+    # Convert event timestamps to the project timezone
     for c in ["eventStart", "eventStop", "modified"]:
         df[c] = pd.to_datetime(df[c], utc=True, errors="coerce").dt.tz_convert(TZ_NAME)
+
+    # Convert capacity columns to numeric values
     for c in ["installedCapacity", "availableCapacity", "nonAvailableCapacity"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["unit_id"] = df["facilityName"].fillna("").astype(str) + "|" + df["unitName"].fillna("").astype(str) + "|" + df["eIC"].fillna("").astype(str)
+
+    df["unit_id"] = (
+        df["facilityName"].fillna("").astype(str)
+        + "|"
+        + df["unitName"].fillna("").astype(str)
+        + "|"
+        + df["eIC"].fillna("").astype(str)
+    )
+
     df["fuel_group"] = np.where(df["fuelType"].eq(ROR_LABEL), "ror", "other")
+
+    # Prefer installed minus available capacity, fallback to reported non-available capacity
     df["effective_outage"] = np.where(
         df["installedCapacity"].notna() & df["availableCapacity"].notna(),
         df["installedCapacity"] - df["availableCapacity"],
         df["nonAvailableCapacity"],
     )
+
     df["effective_outage"] = pd.to_numeric(df["effective_outage"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
     df = df.dropna(subset=["eventStart", "eventStop", "modified"])
+
+    # Remove invalid events without a positive duration
     return df[df["eventStop"] > df["eventStart"]].copy()
 
 
 def latest_version_per_base(x: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only the latest message version for each base event ID.
+    """
     if x.empty:
         return x.copy()
+
     idx = x.groupby("base_id")["version"].idxmax()
     return x.loc[idx].copy()
 
 
 def build_unit_step_segments(events: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build piecewise-constant outage segments for each unit.
+
+    Overlapping messages for the same unit are resolved by taking the maximum
+    active outage capacity at each point in time.
+    """
     seg_rows = []
+
     if events.empty:
         return pd.DataFrame(columns=["unit_id", "fuel_group", "start", "stop", "outage"])
+
+    # Build separate step segments for each physical unit and fuel group
     for (unit_id, fuel_group), g in events.groupby(["unit_id", "fuel_group"], sort=False):
         starts = g[["eventStart", "effective_outage"]].copy()
         starts["delta"] = 1
+
         stops = g[["eventStop", "effective_outage"]].copy()
         stops.columns = ["eventStart", "effective_outage"]
         stops["delta"] = -1
+
         changes = pd.concat([starts, stops], ignore_index=True).rename(columns={"eventStart": "time", "effective_outage": "cap"})
         changes = changes.sort_values(["time", "delta"])
+
         active_counts = defaultdict(int)
         max_heap = []
+
+        # Store start/stop changes by timestamp for fast interval reconstruction
         grouped = {t: grp[["cap", "delta"]].to_records(index=False) for t, grp in changes.groupby("time", sort=True)}
         change_times = changes["time"].drop_duplicates().sort_values().to_list()
+
+        # Step through intervals between consecutive change timestamps
         for i, t in enumerate(change_times[:-1]):
+
+            # Apply all starts/stops at the current timestamp
             for rec in grouped[t]:
                 cap = float(rec.cap)
+
                 if int(rec.delta) == 1:
                     active_counts[cap] += 1
                     heapq.heappush(max_heap, -cap)
                 else:
                     active_counts[cap] -= 1
+
+            # Remove capacities that are no longer active from the heap top
             while max_heap and active_counts[-max_heap[0]] <= 0:
                 heapq.heappop(max_heap)
+
             next_t = change_times[i + 1]
             current_outage = -max_heap[0] if max_heap else 0.0
+
+            # Keep only positive outage intervals with valid duration
             if next_t > t and current_outage > 0:
                 seg_rows.append((unit_id, fuel_group, t, next_t, current_outage))
+
     return pd.DataFrame(seg_rows, columns=["unit_id", "fuel_group", "start", "stop", "outage"])
 
 
 def aggregate_unit_segments_to_global(unit_segments: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate unit-level outage segments into global outage segments.
+    """
     if unit_segments.empty:
         return pd.DataFrame(columns=["start", "stop", "outage_ror", "outage_other", "outage_total"])
+
     deltas = defaultdict(lambda: {"ror": 0.0, "other": 0.0})
+
+    # Convert each unit segment into start and stop deltas
     for row in unit_segments.itertuples():
         deltas[row.start][row.fuel_group] += row.outage
         deltas[row.stop][row.fuel_group] -= row.outage
+
     cur_ror = cur_other = 0.0
     rows = []
     times = sorted(deltas.keys())
+
+    # Reconstruct total outage levels between consecutive change timestamps
     for i, t in enumerate(times[:-1]):
         cur_ror += deltas[t]["ror"]
         cur_other += deltas[t]["other"]
+
         next_t = times[i + 1]
+
         if next_t > t:
             rows.append((t, next_t, cur_ror, cur_other, cur_ror + cur_other))
+
     return pd.DataFrame(rows, columns=["start", "stop", "outage_ror", "outage_other", "outage_total"])
 
 
 def sample_global_segments_to_grid(global_segments: pd.DataFrame, time_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Sample global outage step segments on the regular quarter-hourly delivery grid.
+    """
     out = pd.DataFrame(index=time_index, columns=["outage_ror", "outage_other", "outage_total"], dtype=float)
     out[:] = 0.0
+
     if global_segments.empty:
         return out
+
     starts = global_segments["start"].to_numpy()
     stops = global_segments["stop"].to_numpy()
     grid = time_index.to_numpy()
+
     idx = np.searchsorted(starts, grid, side="right") - 1
     valid = (idx >= 0) & (grid < stops[np.clip(idx, 0, len(stops) - 1)])
+
+    # Fill each outage column on the regular grid
     for col in ["outage_ror", "outage_other", "outage_total"]:
         vals = global_segments[col].to_numpy()
         arr = np.zeros(len(grid), dtype=float)
         arr[valid] = vals[idx[valid]]
         out[col] = arr
+
     return out
 
 
 def query_outage_qh(date_from: str, date_to: str) -> pd.DataFrame:
+    """
+    Query EEX outages and return quarter-hourly outage features.
+    """
     raw = fetch_outage_events("AT", date_from, date_to)
     df = clean_outage_events(raw)
+
     index = _required_index(date_from, date_to)
+
     latest = latest_version_per_base(df)
+
+    # Keep only active outage events with positive effective outage capacity
     truth_events = latest[(latest["eventStatus"] == "Active") & (latest["effective_outage"] > 0)].copy() if not latest.empty else latest
+
     unit_segments = build_unit_step_segments(truth_events)
     global_segments = aggregate_unit_segments_to_global(unit_segments)
     ts = sample_global_segments_to_grid(global_segments, index)
+
     ts = ts.rename(columns={
         "outage_ror": "outage_ror_true",
         "outage_other": "outage_other_true",
         "outage_total": "outage_total_true",
     })
+
     return ts
 
 # =========================================================
@@ -485,13 +723,22 @@ def query_outage_qh(date_from: str, date_to: str) -> pd.DataFrame:
 # =========================================================
 
 def _safe_sum(df: pd.DataFrame, cols: Iterable[str]) -> pd.Series:
+    """
+    Sum available columns and return zero if none of them exist.
+    """
+    # Keep only columns that are actually present in the dataframe
     present = [c for c in cols if c in df.columns]
+
     if not present:
         return pd.Series(0.0, index=df.index)
+
     return df[present].sum(axis=1)
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add final time, exchange, forecast-error, and outage features.
+    """
     df = df.copy().sort_index()
 
     df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
@@ -501,6 +748,8 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     years = range(df.index.min().year, df.index.max().year + 1)
     holidays = set(hol.Austria(years=years).keys())
+
+    # Mark weekends and Austrian holidays as free days
     df["free_day"] = ((df.index.weekday >= 5) | pd.Series(df.index.date, index=df.index).isin(holidays)).astype(int)
 
     import_day_ahead = _safe_sum(df, [f"{c}_to_AT_day_ahead" for c in EXCHANGE_COUNTRIES])
@@ -516,11 +765,14 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["wind_delta"] = df.get("wind_onshore_mw") - df.get("wind_day_ahead")
     df["solar_delta"] = df.get("solar_mw") - df.get("solar_day_ahead")
 
+    # Ensure outage columns exist even if no outage events were returned
     if "outage_total_true" not in df.columns:
         df["outage_total_true"] = 0.0
+
     df["ramp_outage"] = df["outage_total_true"] - df["outage_total_true"].shift(1)
     df["ramp_outage"] = df["ramp_outage"].fillna(0.0)
 
+    # Add missing final columns so the exported schema stays stable
     for col in FINAL_COLUMNS:
         if col != "datetime" and col not in df.columns:
             df[col] = np.nan
@@ -533,8 +785,12 @@ def load_id1_prices_qh(
     date_to: str,
     price_path: str | Path | None = None,
 ) -> pd.DataFrame:
+    """
+    Load and validate confidential ID1 quarter-hourly prices for the requested period.
+    """
     path = Path(price_path) if price_path is not None else default_price_path()
 
+    # Stop early if the confidential price file is missing
     if not path.exists():
         raise FileNotFoundError(
             f"ID1 price file not found: {path}\n"
@@ -553,6 +809,7 @@ def load_id1_prices_qh(
 
     df_prices["datetime"] = pd.to_datetime(df_prices["datetime"])
 
+    # Localize Excel timestamps and handle daylight-saving-time edge cases
     df_prices["datetime"] = (
         df_prices["datetime"]
         .dt.tz_localize(
@@ -580,6 +837,7 @@ def load_id1_prices_qh(
 
     missing = required.difference(pd.DatetimeIndex(df_prices["datetime"]))
 
+    # The model cannot run if the confidential target price file is incomplete
     if not missing.empty:
         raise ValueError(
             "ID1 price file does not fully cover the requested period.\n"
@@ -600,6 +858,9 @@ def build_increment(
     date_to: str,
     price_path: str | Path | None = None,
 ) -> pd.DataFrame:
+    """
+    Query raw inputs, merge them, and build final features for one date range.
+    """
     entsoe = query_entsoe_qh(date_from, date_to)
     outage = query_outage_qh(date_from, date_to)
     prices = load_id1_prices_qh(date_from, date_to, price_path=price_path)
@@ -617,27 +878,38 @@ def build_increment(
 # =========================================================
 
 def load_existing(path: Path) -> pd.DataFrame:
+    """
+    Load an existing combined dataset or return an empty dataframe with final columns.
+    """
     if not path.exists():
         return pd.DataFrame(columns=FINAL_COLUMNS)
+
     df = pd.read_csv(path, parse_dates=["datetime"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(TZ_NAME)
+
     return df
 
 
 def save_combined(df: pd.DataFrame, path: Path) -> None:
+    """
+    Save the combined dataset with stable column order and recomputed outage ramp.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(TZ_NAME)
     df = df.sort_values("datetime").drop_duplicates("datetime", keep="last")
 
-    # recompute ramp after combining, so first row of every increment is correct.
+    # Recompute ramp after combining, so first row of every increment is correct
     if "outage_total_true" in df.columns:
         df["ramp_outage"] = df["outage_total_true"] - df["outage_total_true"].shift(1)
         df["ramp_outage"] = df["ramp_outage"].fillna(0.0)
 
+    # Add missing columns to keep the saved schema stable
     for col in FINAL_COLUMNS:
         if col not in df.columns:
             df[col] = np.nan
+
     df = df[FINAL_COLUMNS]
     df.to_csv(path, index=False)
 
@@ -651,27 +923,37 @@ def prepare_all_data(
     """
     Ensure that data_final/combined_data_qh.csv covers the requested inclusive date range.
 
-    If timestamps are missing, only missing contiguous QH spans are queried,
+    If timestamps are missing, only missing contiguous quarter-hourly spans are queried,
     transformed into final features, appended, deduplicated, and written back.
     """
     path = Path(data_path) if data_path is not None else default_data_path()
+
     existing = load_existing(path)
     spans = _missing_spans(existing, date_from, date_to)
 
     if not spans:
         print(f"Data already covers {date_from} to {date_to}.")
+
         required = _required_index(date_from, date_to)
         mask = existing["datetime"].isin(required)
+
         return existing.loc[mask, FINAL_COLUMNS].sort_values("datetime").reset_index(drop=True)
 
     increments = []
+
+    # Query and build only the contiguous missing spans
     for start_ts, end_ts in spans:
         q_from = _date_str(start_ts)
         q_to = _date_str(end_ts)
+
         print(f"Missing span: {start_ts} -> {end_ts}. Querying {q_from} to {q_to}.")
+
         inc = build_increment(q_from, q_to, price_path=price_path)
         inc["datetime"] = pd.to_datetime(inc["datetime"], utc=True).dt.tz_convert(TZ_NAME)
+
+        # Trim the queried increment back to the exact missing span
         inc = inc[(inc["datetime"] >= start_ts) & (inc["datetime"] <= end_ts)]
+
         increments.append(inc)
 
     combined = pd.concat([existing, *increments], ignore_index=True)
@@ -680,6 +962,8 @@ def prepare_all_data(
     result = load_existing(path)
     required = _required_index(date_from, date_to)
     result = result[result["datetime"].isin(required)].sort_values("datetime").reset_index(drop=True)
+
     print(f"Saved combined data to: {path}")
     print(f"Returned rows: {len(result):,}")
+
     return result[FINAL_COLUMNS]
